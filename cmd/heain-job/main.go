@@ -7,7 +7,7 @@ import (
 	"flag"
 	"log"
 
-	"github.com/JakkritB/heain-job/internal/coreclient"
+	"github.com/heainframework/heain-sdk/coreclient"
 )
 
 func main() {

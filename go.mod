@@ -1,3 +1,7 @@
-module github.com/JakkritB/heain-job
+module github.com/heainframework/heain-job
 
 go 1.24.7
+
+require github.com/heainframework/heain-sdk v0.0.0-00010101000000-000000000000
+
+replace github.com/heainframework/heain-sdk => ../heain-sdk
