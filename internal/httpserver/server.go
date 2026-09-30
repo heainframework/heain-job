@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/heainframework/heain-job/internal/jobapp"
 	"github.com/heainframework/heain-job/internal/registry"
@@ -32,6 +33,7 @@ func New(reg *registry.Registry) *Server {
 	}
 	s.mux.HandleFunc("/register", s.handleRegister)
 	s.mux.HandleFunc("/deregister", s.handleDeregister)
+	s.mux.HandleFunc("/registry/", s.handleRegistryLookup)
 	s.mux.HandleFunc("/health", s.handleHealth)
 	return s
 }
@@ -82,6 +84,35 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 
 	s.Registry.Deregister(req.StrategyName)
 	w.WriteHeader(http.StatusOK)
+}
+
+// handleRegistryLookup is a read-only endpoint letting another service
+// (e.g. heain-core's P3 Executor bridge) resolve a strategy name to its
+// registered module endpoint, reusing heain-job's own TTL-backed
+// registry as the single live source of truth rather than a second,
+// separately-configured copy of the same mapping. Returns 404 if the
+// strategy is unregistered or has gone stale (registry.ErrNotRegistered
+// / registry.ErrStale) -- the caller treats both the same way.
+func (s *Server) handleRegistryLookup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	strategy := strings.TrimPrefix(r.URL.Path, "/registry/")
+	if strategy == "" {
+		http.Error(w, "missing strategy name in path", http.StatusBadRequest)
+		return
+	}
+
+	ep, err := s.Registry.Lookup(strategy)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(ep)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
