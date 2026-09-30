@@ -1,6 +1,6 @@
 // Command heain-job is the entrypoint for the heain-job orchestration
 // service. It never links against heain-core — see the package docs on
-// internal/coreclient for how it talks to a running heain-core node.
+// the heain-sdk coreclient package for how it talks to a running heain-core node.
 package main
 
 import (
