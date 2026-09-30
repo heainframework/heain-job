@@ -100,3 +100,42 @@ type AuditRecord struct {
 	Detail string
 	At     time.Time
 }
+
+// DefaultResumeSemantics is applied whenever a JobDescriptor omits its
+// own Resume value. Decided 2026-09-30: most media-processing sub-units
+// tolerate redoing a reassigned chunk with no ill effect, so the cheaper
+// guarantee is the default; a module whose duty genuinely needs
+// exactly-once semantics must opt into ResumeTransactional explicitly.
+const DefaultResumeSemantics = ResumeIdempotent
+
+// EffectiveResume returns j.Resume, or DefaultResumeSemantics if unset.
+func (j JobDescriptor) EffectiveResume() ResumeSemantics {
+	if j.Resume == "" {
+		return DefaultResumeSemantics
+	}
+	return j.Resume
+}
+
+// ModuleEndpoint is what a data-type module declares about itself when it
+// registers a SplitStrategy/MergeStrategy implementation with heain-job:
+// which strategy name it implements, its own base URL for the /split and
+// /merge callback endpoints it exposes, and the shared-secret token
+// heain-job must present when calling it.
+//
+// Registration mechanism decision (2026-09-30): HTTP callback, not an
+// in-process plug-in — each Layer 3 module is its own container, so a
+// SplitStrategy/MergeStrategy cannot be linked into heain-job's binary.
+// Auth decision (2026-09-30): shared-secret token per module, not mTLS —
+// heain-job and every module run inside the same internal Docker network,
+// never exposed to the internet, so a per-module secret is enough to stop
+// a wrong/unrelated container from calling another module's endpoint by
+// mistake, without standing up a second PKI alongside heain-core's
+// existing node-to-node mTLS (a different concern — that authenticates
+// Layer 2 network identity, not Layer 3 container-to-container calls on a
+// trusted internal network).
+type ModuleEndpoint struct {
+	ModuleName   string `json:"module_name"`
+	StrategyName string `json:"strategy_name"`
+	BaseURL      string `json:"base_url"`
+	Token        string `json:"token"`
+}
