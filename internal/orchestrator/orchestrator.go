@@ -76,6 +76,10 @@ type mergeResponse struct {
 func (o *Orchestrator) Split(ctx context.Context, job jobapp.JobDescriptor) ([]jobapp.SubUnit, error) {
 	ep, err := o.Registry.Lookup(job.OwningModule)
 	if err != nil {
+		_ = o.Audit.Record(jobapp.AuditRecord{
+			Action: "module_lookup_failed",
+			Detail: fmt.Sprintf("job=%s module=%s error=%s", job.JobID, job.OwningModule, err),
+		})
 		return nil, err
 	}
 
@@ -99,6 +103,10 @@ func (o *Orchestrator) Split(ctx context.Context, job jobapp.JobDescriptor) ([]j
 func (o *Orchestrator) Merge(ctx context.Context, job jobapp.JobDescriptor, results []jobapp.SubUnitResult) (jobapp.MergedResult, error) {
 	ep, err := o.Registry.Lookup(job.OwningModule)
 	if err != nil {
+		_ = o.Audit.Record(jobapp.AuditRecord{
+			Action: "module_lookup_failed",
+			Detail: fmt.Sprintf("job=%s module=%s error=%s", job.JobID, job.OwningModule, err),
+		})
 		return jobapp.MergedResult{}, err
 	}
 

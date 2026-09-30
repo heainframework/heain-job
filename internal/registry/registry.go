@@ -10,6 +10,7 @@ package registry
 import (
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/heainframework/heain-job/internal/jobapp"
 )
@@ -22,6 +23,26 @@ var ErrNotRegistered = errors.New("registry: no module registered for this strat
 // same name/base URL/token is treated as a refresh, not a conflict).
 var ErrAlreadyRegistered = errors.New("registry: strategy name already registered to a different module")
 
+// ErrStale is returned by Lookup when a module was registered but hasn't
+// re-registered ("heartbeated") within the registry's TTL. It is treated
+// as equivalent to not-registered by every caller: module-restart-mid-job
+// is deliberately not special-cased beyond this -- a stale entry fails
+// fast here instead of only being discovered after a callModule retry
+// budget is exhausted, and recovery from there is the existing
+// checkpoint/resume pattern, not new machinery.
+var ErrStale = errors.New("registry: module registration expired (no re-registration within TTL); treating as unregistered")
+
+// DefaultTTL is how long a registration stays valid without a
+// re-registration before Lookup treats it as gone. heain-sdk's jobclient
+// re-registers every DefaultReregisterInterval (15s), well inside this
+// 30s window, so a healthy module is never mistaken for stale.
+const DefaultTTL = 30 * time.Second
+
+type entry struct {
+	endpoint jobapp.ModuleEndpoint
+	lastSeen time.Time
+}
+
 // Registry is a thread-safe, in-memory registration store. A production
 // deployment may back this with a small local store for restart-durability
 // (matching the same "operator needs this to survive a crash" reasoning
@@ -29,23 +50,32 @@ var ErrAlreadyRegistered = errors.New("registry: strategy name already registere
 // but v1 ships in-memory only — modules re-register on their own restart.
 type Registry struct {
 	mu        sync.RWMutex
-	endpoints map[string]jobapp.ModuleEndpoint // keyed by StrategyName
+	endpoints map[string]entry // keyed by StrategyName
+	ttl       time.Duration
 }
 
-// New returns an empty Registry.
+// New returns an empty Registry using DefaultTTL.
 func New() *Registry {
-	return &Registry{endpoints: make(map[string]jobapp.ModuleEndpoint)}
+	return NewWithTTL(DefaultTTL)
 }
 
-// Register adds or refreshes a module's endpoint for a given strategy name.
+// NewWithTTL returns an empty Registry with a custom staleness TTL,
+// mainly so tests can exercise expiry without waiting DefaultTTL in
+// real time.
+func NewWithTTL(ttl time.Duration) *Registry {
+	return &Registry{endpoints: make(map[string]entry), ttl: ttl}
+}
+
+// Register adds or refreshes ("heartbeats") a module's endpoint for a
+// given strategy name.
 func (r *Registry) Register(ep jobapp.ModuleEndpoint) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if existing, ok := r.endpoints[ep.StrategyName]; ok && existing.ModuleName != ep.ModuleName {
+	if existing, ok := r.endpoints[ep.StrategyName]; ok && existing.endpoint.ModuleName != ep.ModuleName {
 		return ErrAlreadyRegistered
 	}
-	r.endpoints[ep.StrategyName] = ep
+	r.endpoints[ep.StrategyName] = entry{endpoint: ep, lastSeen: time.Now()}
 	return nil
 }
 
@@ -57,27 +87,32 @@ func (r *Registry) Deregister(strategyName string) {
 	delete(r.endpoints, strategyName)
 }
 
-// Lookup returns the registered endpoint for a strategy name.
+// Lookup returns the registered endpoint for a strategy name. It returns
+// ErrStale, not the endpoint, if the module hasn't re-registered within
+// the registry's TTL.
 func (r *Registry) Lookup(strategyName string) (jobapp.ModuleEndpoint, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	ep, ok := r.endpoints[strategyName]
+	e, ok := r.endpoints[strategyName]
 	if !ok {
 		return jobapp.ModuleEndpoint{}, ErrNotRegistered
 	}
-	return ep, nil
+	if time.Since(e.lastSeen) > r.ttl {
+		return jobapp.ModuleEndpoint{}, ErrStale
+	}
+	return e.endpoint, nil
 }
 
-// All returns every currently-registered endpoint, for diagnostics/health
-// reporting.
+// All returns every currently-registered (non-expired-filtered) endpoint,
+// for diagnostics/health reporting.
 func (r *Registry) All() []jobapp.ModuleEndpoint {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	out := make([]jobapp.ModuleEndpoint, 0, len(r.endpoints))
-	for _, ep := range r.endpoints {
-		out = append(out, ep)
+	for _, e := range r.endpoints {
+		out = append(out, e.endpoint)
 	}
 	return out
 }
