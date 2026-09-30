@@ -1,14 +1,3 @@
-// Package orchestrator implements heain-job's core split/checkpoint/
-// reassign/merge workflow. It never processes content itself — it drives
-// the workflow and delegates the actual split/merge decisions to whichever
-// module is registered for a job's strategy, over the HTTP callback
-// mechanism designed in "heain-job <-> module registration mechanism"
-// (see internal/jobapp.ModuleEndpoint's docs).
-//
-// Talking to heain-core itself (P1-P4: ingest/dispatch/execute/staging) is
-// a separate concern, handled by the heain-sdk coreclient package (see
-// cmd/heain-job) — this package only ever calls out to sibling Layer 3
-// modules.
 package orchestrator
 
 import (
@@ -20,31 +9,50 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/heainframework/heain-job/internal/audit"
 	"github.com/heainframework/heain-job/internal/jobapp"
 	"github.com/heainframework/heain-job/internal/registry"
 )
 
-// DefaultCallbackTimeout bounds a single /split or /merge call to a
-// registered module. Split/merge are expected to be fast planning/assembly
-// calls, not the heavy processing itself (which still runs through
-// heain-core's P2/P3 dispatch, unchanged).
-const DefaultCallbackTimeout = 30 * time.Second
+const DefaultCallbackTimeout = 10 * time.Second
+const DefaultMaxRetries = 3
+const DefaultRetryBaseDelay = 1 * time.Second
 
-// Orchestrator ties the registry, audit log, and module HTTP callbacks
-// together.
-type Orchestrator struct {
-	Registry *registry.Registry
-	Audit    *audit.Logger
-	Client   *http.Client
+type moduleHTTPError struct {
+	StatusCode int
+	Body       string
 }
 
-// New returns an Orchestrator with sane defaults.
-func New(reg *registry.Registry, log *audit.Logger) *Orchestrator {
+func (e *moduleHTTPError) Error() string {
+	return fmt.Sprintf("module returned %d: %s", e.StatusCode, e.Body)
+}
+
+func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if httpErr, ok := err.(*moduleHTTPError); ok {
+		return httpErr.StatusCode >= 500
+	}
+	return true // transport-level error (connection refused, DNS, timeout, etc.)
+}
+
+// AuditRecorder is satisfied by *audit.Logger (and by any test double).
+// Declared locally so this package doesn't need to import internal/audit.
+type AuditRecorder interface {
+	Record(jobapp.AuditRecord) error
+}
+
+type Orchestrator struct {
+	Registry *registry.Registry
+	Client   *http.Client
+	Audit    AuditRecorder
+}
+
+func New(reg *registry.Registry, auditLog AuditRecorder) *Orchestrator {
 	return &Orchestrator{
 		Registry: reg,
-		Audit:    log,
 		Client:   &http.Client{Timeout: DefaultCallbackTimeout},
+		Audit:    auditLog,
 	}
 }
 
@@ -65,64 +73,89 @@ type mergeResponse struct {
 	Result jobapp.MergedResult `json:"result"`
 }
 
-// Split calls the registered module's /split endpoint for the job's
-// strategy (j.OwningModule) and records the decision to the audit log.
-func (o *Orchestrator) Split(ctx context.Context, j jobapp.JobDescriptor) ([]jobapp.SubUnit, error) {
-	ep, err := o.Registry.Lookup(j.OwningModule)
+func (o *Orchestrator) Split(ctx context.Context, job jobapp.JobDescriptor) ([]jobapp.SubUnit, error) {
+	ep, err := o.Registry.Lookup(job.OwningModule)
 	if err != nil {
-		return nil, fmt.Errorf("orchestrator: split lookup for %q: %w", j.OwningModule, err)
+		return nil, err
 	}
 
-	reqBody, err := json.Marshal(splitRequest{Job: j})
+	reqBody, err := json.Marshal(splitRequest{Job: job})
 	if err != nil {
-		return nil, fmt.Errorf("orchestrator: marshal split request: %w", err)
+		return nil, err
 	}
 
 	var resp splitResponse
 	if err := o.callModule(ctx, ep, "/split", reqBody, &resp); err != nil {
-		return nil, fmt.Errorf("orchestrator: split call to %q: %w", ep.ModuleName, err)
+		return nil, err
 	}
 
 	_ = o.Audit.Record(jobapp.AuditRecord{
-		JobID:  j.JobID,
 		Action: "split",
-		Detail: fmt.Sprintf("module=%s sub_units=%d", ep.ModuleName, len(resp.SubUnits)),
+		Detail: fmt.Sprintf("job=%s module=%s sub_units=%d", job.JobID, job.OwningModule, len(resp.SubUnits)),
 	})
-
 	return resp.SubUnits, nil
 }
 
-// Merge calls the registered module's /merge endpoint for the job's
-// strategy, combining completed sub-unit results, and records the
-// decision.
-func (o *Orchestrator) Merge(ctx context.Context, j jobapp.JobDescriptor, results []jobapp.SubUnitResult) (jobapp.MergedResult, error) {
-	ep, err := o.Registry.Lookup(j.OwningModule)
+func (o *Orchestrator) Merge(ctx context.Context, job jobapp.JobDescriptor, results []jobapp.SubUnitResult) (jobapp.MergedResult, error) {
+	ep, err := o.Registry.Lookup(job.OwningModule)
 	if err != nil {
-		return jobapp.MergedResult{}, fmt.Errorf("orchestrator: merge lookup for %q: %w", j.OwningModule, err)
+		return jobapp.MergedResult{}, err
 	}
 
-	reqBody, err := json.Marshal(mergeRequest{Job: j, Results: results})
+	reqBody, err := json.Marshal(mergeRequest{Job: job, Results: results})
 	if err != nil {
-		return jobapp.MergedResult{}, fmt.Errorf("orchestrator: marshal merge request: %w", err)
+		return jobapp.MergedResult{}, err
 	}
 
 	var resp mergeResponse
 	if err := o.callModule(ctx, ep, "/merge", reqBody, &resp); err != nil {
-		return jobapp.MergedResult{}, fmt.Errorf("orchestrator: merge call to %q: %w", ep.ModuleName, err)
+		return jobapp.MergedResult{}, err
 	}
 
 	_ = o.Audit.Record(jobapp.AuditRecord{
-		JobID:  j.JobID,
-		Action: "merge_complete",
-		Detail: fmt.Sprintf("module=%s sub_unit_results=%d", ep.ModuleName, len(results)),
+		Action: "merge",
+		Detail: fmt.Sprintf("job=%s module=%s", job.JobID, job.OwningModule),
 	})
-
 	return resp.Result, nil
 }
 
-// callModule POSTs body to ep.BaseURL+path, authenticated with ep.Token,
-// and decodes the JSON response into out.
 func (o *Orchestrator) callModule(ctx context.Context, ep jobapp.ModuleEndpoint, path string, body []byte, out interface{}) error {
+	var lastErr error
+	for attempt := 0; attempt <= DefaultMaxRetries; attempt++ {
+		if attempt > 0 {
+			delay := DefaultRetryBaseDelay * time.Duration(1<<(attempt-1))
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		err := o.doCallModule(ctx, ep, path, body, out)
+		if err == nil {
+			if attempt > 0 {
+				_ = o.Audit.Record(jobapp.AuditRecord{
+					Action: "module_call_retry_succeeded",
+					Detail: fmt.Sprintf("module=%s path=%s attempt=%d", ep.ModuleName, path, attempt+1),
+				})
+			}
+			return nil
+		}
+
+		lastErr = err
+		_ = o.Audit.Record(jobapp.AuditRecord{
+			Action: "module_call_failed",
+			Detail: fmt.Sprintf("module=%s path=%s attempt=%d error=%s", ep.ModuleName, path, attempt+1, err),
+		})
+
+		if !isRetryable(err) {
+			return err
+		}
+	}
+	return fmt.Errorf("after %d attempts: %w", DefaultMaxRetries+1, lastErr)
+}
+
+func (o *Orchestrator) doCallModule(ctx context.Context, ep jobapp.ModuleEndpoint, path string, body []byte, out interface{}) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ep.BaseURL+path, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -138,8 +171,7 @@ func (o *Orchestrator) callModule(ctx context.Context, ep jobapp.ModuleEndpoint,
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("module returned %d: %s", resp.StatusCode, string(b))
+		return &moduleHTTPError{StatusCode: resp.StatusCode, Body: string(b)}
 	}
-
 	return json.NewDecoder(resp.Body).Decode(out)
 }
