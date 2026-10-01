@@ -133,9 +133,20 @@ func (j JobDescriptor) EffectiveResume() ResumeSemantics {
 // existing node-to-node mTLS (a different concern — that authenticates
 // Layer 2 network identity, not Layer 3 container-to-container calls on a
 // trusted internal network).
+//
+// ReplicaID (Stage B, 2026-10-01, see design-notes/n-tier-generalization.md
+// "heain-job's load-aware scheduler"): distinguishes multiple concurrent
+// instances of the same module/strategy from each other, so the registry
+// can hold a pool of replicas per strategy instead of exactly one. Empty
+// (the default) means "this module never runs more than one instance of
+// itself" — the original, still-fully-supported single-instance case
+// (e.g. heain-image today) — and is backward compatible with every
+// existing caller: an empty ReplicaID is just one more replica, keyed by
+// the empty string.
 type ModuleEndpoint struct {
 	ModuleName   string `json:"module_name"`
 	StrategyName string `json:"strategy_name"`
 	BaseURL      string `json:"base_url"`
 	Token        string `json:"token"`
+	ReplicaID    string `json:"replica_id,omitempty"`
 }

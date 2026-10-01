@@ -1,5 +1,6 @@
 // Package httpserver exposes heain-job's own HTTP surface: module
-// registration, and (as the orchestrator grows) job submission/status.
+// registration, progress reporting (Stage B), and (as the orchestrator
+// grows) job submission/status.
 //
 // This is a plain, internal-network HTTP server — deliberately NOT the
 // mTLS node-to-node transport heain-core's Layer 2 nodes use, per the
@@ -9,6 +10,7 @@
 package httpserver
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -34,6 +36,7 @@ func New(reg *registry.Registry) *Server {
 	s.mux.HandleFunc("/register", s.handleRegister)
 	s.mux.HandleFunc("/deregister", s.handleDeregister)
 	s.mux.HandleFunc("/registry/", s.handleRegistryLookup)
+	s.mux.HandleFunc("/progress", s.handleProgress)
 	s.mux.HandleFunc("/health", s.handleHealth)
 	return s
 }
@@ -64,7 +67,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("heain-job: registered module %q for strategy %q at %q", ep.ModuleName, ep.StrategyName, ep.BaseURL)
+	log.Printf("heain-job: registered module %q for strategy %q replica %q at %q", ep.ModuleName, ep.StrategyName, ep.ReplicaID, ep.BaseURL)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -76,13 +79,14 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		StrategyName string `json:"strategy_name"`
+		ReplicaID    string `json:"replica_id,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	s.Registry.Deregister(req.StrategyName)
+	s.Registry.DeregisterReplica(req.StrategyName, req.ReplicaID)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -92,7 +96,10 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 // registry as the single live source of truth rather than a second,
 // separately-configured copy of the same mapping. Returns 404 if the
 // strategy is unregistered or has gone stale (registry.ErrNotRegistered
-// / registry.ErrStale) -- the caller treats both the same way.
+// / registry.ErrStale) -- the caller treats both the same way. This
+// stays single-endpoint ("any one live replica") on purpose -- callers
+// needing the full Stage B pool use the registry's LookupPool directly
+// in-process (the orchestrator), not over HTTP.
 func (s *Server) handleRegistryLookup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -113,6 +120,52 @@ func (s *Server) handleRegistryLookup(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(ep)
+}
+
+// handleProgress is Stage B's self-reporting endpoint: a replica
+// actively executing a SubUnit POSTs its progress here, authenticated
+// with the same shared-secret token it registered with for this exact
+// (strategy, replica) pair -- the same per-module-trust model already
+// used for /split and /merge, just in the reverse call direction.
+func (s *Server) handleProgress(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req jobapp.ProgressReport
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.StrategyName == "" || req.SubUnitID == "" {
+		http.Error(w, "strategy_name and sub_unit_id are required", http.StatusBadRequest)
+		return
+	}
+
+	const prefix = "Bearer "
+	h := r.Header.Get("Authorization")
+	if len(h) <= len(prefix) || h[:len(prefix)] != prefix {
+		http.Error(w, "missing bearer token", http.StatusUnauthorized)
+		return
+	}
+	token := h[len(prefix):]
+
+	ep, err := s.Registry.LookupReplica(req.StrategyName, req.ReplicaID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(token), []byte(ep.Token)) != 1 {
+		http.Error(w, "invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	if err := s.Registry.ReportProgress(req.StrategyName, req.ReplicaID, req.SubUnitID, req.PercentComplete, req.Status); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
