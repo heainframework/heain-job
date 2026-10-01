@@ -67,6 +67,11 @@ type splitRequest struct {
 	// doesn't need real bytes (e.g. heain-image's v1 whole-job-to-one-
 	// worker placeholder) simply ignores it.
 	Payload []byte `json:"payload,omitempty"`
+	// DesiredChunks hints how many SubUnits to split into, based on how
+	// many live replicas RunFannedOutJob actually found in the pool at
+	// split time. A module whose /split has its own fixed chunking rule
+	// may ignore this.
+	DesiredChunks int `json:"desired_chunks,omitempty"`
 }
 
 type splitResponse struct {
@@ -173,7 +178,7 @@ func (o *Orchestrator) RunFannedOutJob(ctx context.Context, job jobapp.JobDescri
 	}
 
 	splitEp := lowestReplicaID(pool)
-	reqBody, err := json.Marshal(splitRequest{Job: job, Payload: inputPayload})
+	reqBody, err := json.Marshal(splitRequest{Job: job, Payload: inputPayload, DesiredChunks: len(pool)})
 	if err != nil {
 		return jobapp.MergedResult{}, err
 	}
