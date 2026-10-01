@@ -10,7 +10,9 @@
 package httpserver
 
 import (
+	"context"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -18,25 +20,39 @@ import (
 
 	"github.com/heainframework/heain-job/internal/jobapp"
 	"github.com/heainframework/heain-job/internal/registry"
+	"github.com/heainframework/heain-job/internal/scheduler"
 )
 
-// Server wires the registry (and, later, the orchestrator) to HTTP
-// handlers.
-type Server struct {
-	Registry *registry.Registry
-	mux      *http.ServeMux
+// Orchestrator is the subset of *orchestrator.Orchestrator that
+// handleRunJob needs. Declared locally (not imported from
+// internal/orchestrator) so httpserver doesn't need a direct package
+// dependency beyond this one call -- satisfied structurally by
+// *orchestrator.Orchestrator.
+type Orchestrator interface {
+	RunFannedOutJob(ctx context.Context, job jobapp.JobDescriptor, inputPayload []byte, headroom scheduler.CapacityHeadroom) (jobapp.MergedResult, error)
 }
 
-// New builds a Server with its routes registered.
-func New(reg *registry.Registry) *Server {
+// Server wires the registry and orchestrator to HTTP handlers.
+type Server struct {
+	Registry     *registry.Registry
+	Orchestrator Orchestrator // nil = /run-job disabled (e.g. a deployment with no orchestrator wired yet)
+	mux          *http.ServeMux
+}
+
+// New builds a Server with its routes registered. orch may be nil,
+// which disables /run-job (returns 503) without affecting any other
+// route -- registration/progress/health never depended on it.
+func New(reg *registry.Registry, orch Orchestrator) *Server {
 	s := &Server{
-		Registry: reg,
-		mux:      http.NewServeMux(),
+		Registry:     reg,
+		Orchestrator: orch,
+		mux:          http.NewServeMux(),
 	}
 	s.mux.HandleFunc("/register", s.handleRegister)
 	s.mux.HandleFunc("/deregister", s.handleDeregister)
 	s.mux.HandleFunc("/registry/", s.handleRegistryLookup)
 	s.mux.HandleFunc("/progress", s.handleProgress)
+	s.mux.HandleFunc("/run-job", s.handleRunJob)
 	s.mux.HandleFunc("/health", s.handleHealth)
 	return s
 }
@@ -166,6 +182,55 @@ func (s *Server) handleProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// handleRunJob (Stage B) is heain-job's first real job-submission
+// endpoint: POST {"job": {...}, "payload_b64": "..."} runs
+// Orchestrator.RunFannedOutJob end-to-end (split across the live
+// replica pool, load-aware assignment, concurrent /process-subunit
+// calls, merge) and returns the merged result. v1 uses a constant
+// capacity-headroom function (every replica reports the same raw
+// headroom) -- see design-notes/n-tier-generalization.md's note that
+// the remaining-load half of the score already captures the "near done
+// vs. just started" distinction this was built for; querying each
+// replica's real RAM/GPU/CPU is a tracked future increment, not a v1
+// blocker.
+func (s *Server) handleRunJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.Orchestrator == nil {
+		http.Error(w, "no orchestrator wired on this heain-job instance", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req struct {
+		Job        jobapp.JobDescriptor `json:"job"`
+		PayloadB64 string               `json:"payload_b64"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	payload, err := base64.StdEncoding.DecodeString(req.PayloadB64)
+	if err != nil {
+		http.Error(w, "bad payload_b64: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	constantHeadroom := func(jobapp.ModuleEndpoint) float64 { return 100 }
+	result, err := s.Orchestrator.RunFannedOutJob(r.Context(), req.Job, payload, constantHeadroom)
+	if err != nil {
+		http.Error(w, "job failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"job_id":      result.JobID,
+		"output_b64":  base64.StdEncoding.EncodeToString(result.Output),
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

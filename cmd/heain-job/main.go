@@ -53,7 +53,7 @@ func main() {
 	orch := orchestrator.New(reg, auditLog)
 	_ = orch // wired into job submission endpoints once they exist
 
-	srv := httpserver.New(reg)
+	srv := httpserver.New(reg, orch)
 
 	log.Printf("heain-job: connected client configured for heain-core at %s", *coreAddr)
 	log.Printf("heain-job: registration/orchestration HTTP server listening on %s", *listenAddr)
