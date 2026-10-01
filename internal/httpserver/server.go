@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/heainframework/heain-job/internal/capacityquery"
 	"github.com/heainframework/heain-job/internal/jobapp"
 	"github.com/heainframework/heain-job/internal/registry"
 	"github.com/heainframework/heain-job/internal/scheduler"
@@ -219,8 +220,7 @@ func (s *Server) handleRunJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	constantHeadroom := func(jobapp.ModuleEndpoint) float64 { return 100 }
-	result, err := s.Orchestrator.RunFannedOutJob(r.Context(), req.Job, payload, constantHeadroom)
+	result, err := s.Orchestrator.RunFannedOutJob(r.Context(), req.Job, payload, capacityquery.HTTP(nil))
 	if err != nil {
 		http.Error(w, "job failed: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -228,8 +228,8 @@ func (s *Server) handleRunJob(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"job_id":      result.JobID,
-		"output_b64":  base64.StdEncoding.EncodeToString(result.Output),
+		"job_id":     result.JobID,
+		"output_b64": base64.StdEncoding.EncodeToString(result.Output),
 	})
 }
 
