@@ -143,10 +143,25 @@ func (j JobDescriptor) EffectiveResume() ResumeSemantics {
 // (e.g. heain-image today) — and is backward compatible with every
 // existing caller: an empty ReplicaID is just one more replica, keyed by
 // the empty string.
+//
+// Zone (added for reassignment-time P7 sovereignty filtering — Group A
+// item 6, "heain-job cross-industry universality requirements"): the
+// data-residency zone this replica physically runs in, matching
+// heain-core's own P7 Sovereignty-Aware Broadcast concept. Empty (the
+// default) means "unrestricted" — every existing module/caller that
+// never sets this is unaffected, and a job with no SovereigntyZone set
+// is never filtered by zone at all. Only a job that explicitly declares
+// a SovereigntyZone narrows candidate replicas to ones whose own Zone
+// matches (or is itself empty, meaning the replica hasn't declared a
+// restriction and is eligible for any zone) — this is a reassignment-time
+// eligibility filter, not a new consensus mechanism, reusing the exact
+// zone-matching semantics already established for heain-core's own
+// sovereignty gate.
 type ModuleEndpoint struct {
 	ModuleName   string `json:"module_name"`
 	StrategyName string `json:"strategy_name"`
 	BaseURL      string `json:"base_url"`
 	Token        string `json:"token"`
 	ReplicaID    string `json:"replica_id,omitempty"`
+	Zone         string `json:"zone,omitempty"`
 }

@@ -15,6 +15,16 @@
 // empty-string key, and Lookup's "any one live replica, deterministically
 // -- lowest replica-id" rule degenerates to exactly the old
 // single-endpoint behavior for it.
+//
+// Stale-SubUnit tracking (2026-10-02, closes "heain-job: stale-replica
+// failover" — a replica that stops reporting progress on one specific
+// SubUnit it claimed is reassigned to another live replica, rather than
+// the orchestrator waiting on it forever): each SubUnit a replica is
+// actively working gets its own last-activity timestamp, started the
+// moment the orchestrator assigns it (AssignSubUnit) and refreshed on
+// every /progress report (ReportProgress) -- not just the replica's own
+// overall lastSeen, which only proves the replica process itself is
+// alive, not that this one SubUnit is making progress.
 package registry
 
 import (
@@ -49,13 +59,19 @@ var ErrStale = errors.New("registry: module registration expired (no re-registra
 // 30s window, so a healthy module is never mistaken for stale.
 const DefaultTTL = 30 * time.Second
 
+type subUnitState struct {
+	percentComplete float64
+	lastActivity    time.Time
+}
+
 type entry struct {
 	endpoint jobapp.ModuleEndpoint
 	lastSeen time.Time
 	// currentLoad maps a SubUnitID this replica is actively executing to
-	// its last-reported percent-complete (0-100). Only entries for
-	// RUNNING sub-units are present -- DONE/FAILED clears the key.
-	currentLoad map[string]float64
+	// its last-known percent-complete and last-activity time. Only
+	// entries for RUNNING sub-units are present -- DONE/FAILED/cleared
+	// removes the key.
+	currentLoad map[string]subUnitState
 }
 
 // ReplicaInfo is a live, non-stale replica returned by LookupPool,
@@ -110,7 +126,7 @@ func (r *Registry) Register(ep jobapp.ModuleEndpoint) error {
 		break // every existing replica shares one ModuleName by this same invariant
 	}
 
-	currentLoad := map[string]float64{}
+	currentLoad := map[string]subUnitState{}
 	if existing, had := replicas[ep.ReplicaID]; had {
 		currentLoad = existing.currentLoad
 	}
@@ -215,7 +231,7 @@ func (r *Registry) LookupPool(strategyName string) []ReplicaInfo {
 		}
 		load := make(map[string]float64, len(e.currentLoad))
 		for k, v := range e.currentLoad {
-			load[k] = v
+			load[k] = v.percentComplete
 		}
 		out = append(out, ReplicaInfo{Endpoint: e.endpoint, CurrentLoad: load})
 	}
@@ -227,8 +243,9 @@ func (r *Registry) LookupPool(strategyName string) []ReplicaInfo {
 // DONE or FAILED report clears it, since the SubUnit is no longer part
 // of that replica's live load either way. A progress report also counts
 // as a liveness signal, refreshing lastSeen exactly like a
-// re-registration would. Returns ErrNotRegistered if the (strategy,
-// replica) pair isn't known.
+// re-registration would, and refreshes that SubUnit's own last-activity
+// timestamp (see SubUnitActivity). Returns ErrNotRegistered if the
+// (strategy, replica) pair isn't known.
 func (r *Registry) ReportProgress(strategyName, replicaID, subUnitID string, percentComplete float64, status jobapp.ProgressStatus) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -242,17 +259,97 @@ func (r *Registry) ReportProgress(strategyName, replicaID, subUnitID string, per
 		return ErrNotRegistered
 	}
 	if e.currentLoad == nil {
-		e.currentLoad = map[string]float64{}
+		e.currentLoad = map[string]subUnitState{}
 	}
 	switch status {
 	case jobapp.ProgressDone, jobapp.ProgressFailed:
 		delete(e.currentLoad, subUnitID)
 	default:
-		e.currentLoad[subUnitID] = percentComplete
+		e.currentLoad[subUnitID] = subUnitState{percentComplete: percentComplete, lastActivity: time.Now()}
 	}
 	e.lastSeen = time.Now()
 	replicas[replicaID] = e
 	return nil
+}
+
+// AssignSubUnit records that a SubUnit has just been dispatched to a
+// replica, starting its staleness clock immediately -- without this, a
+// replica that crashes before ever sending its first /progress report
+// would have no activity record at all, and SubUnitActivity would never
+// be able to tell "never started" apart from "started and stalled".
+// Call this once, right before sending the /process-subunit request.
+// A no-op (returns ErrNotRegistered) if the (strategy, replica) pair
+// isn't known -- callers that already looked the replica up via
+// LookupPool/Lookup won't normally hit this.
+func (r *Registry) AssignSubUnit(strategyName, replicaID, subUnitID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	replicas, ok := r.endpoints[strategyName]
+	if !ok {
+		return ErrNotRegistered
+	}
+	e, ok := replicas[replicaID]
+	if !ok {
+		return ErrNotRegistered
+	}
+	if e.currentLoad == nil {
+		e.currentLoad = map[string]subUnitState{}
+	}
+	if _, already := e.currentLoad[subUnitID]; !already {
+		e.currentLoad[subUnitID] = subUnitState{percentComplete: 0, lastActivity: time.Now()}
+		replicas[replicaID] = e
+	}
+	return nil
+}
+
+// ClearSubUnit removes a SubUnit from a replica's live load, regardless
+// of outcome -- used by the orchestrator once a SubUnit has been
+// reassigned away from this replica, or once its own /process-subunit
+// call has returned (success or failure), so a completed/abandoned
+// SubUnit never continues to count toward that replica's assumed load
+// or get flagged stale after the fact.
+func (r *Registry) ClearSubUnit(strategyName, replicaID, subUnitID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	replicas, ok := r.endpoints[strategyName]
+	if !ok {
+		return
+	}
+	e, ok := replicas[replicaID]
+	if !ok {
+		return
+	}
+	delete(e.currentLoad, subUnitID)
+	replicas[replicaID] = e
+}
+
+// SubUnitActivity returns when a specific (strategy, replica, subUnit)
+// last showed activity -- either its initial AssignSubUnit call or its
+// most recent ReportProgress -- and whether that SubUnit is currently
+// tracked at all for that replica (false once it's DONE/FAILED/cleared,
+// or if it was never assigned there in the first place). Used by the
+// orchestrator's staleness watcher to detect a SubUnit whose replica has
+// stopped making progress on it specifically, independent of whether
+// that replica's own overall registration (lastSeen) still looks fresh.
+func (r *Registry) SubUnitActivity(strategyName, replicaID, subUnitID string) (time.Time, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	replicas, ok := r.endpoints[strategyName]
+	if !ok {
+		return time.Time{}, false
+	}
+	e, ok := replicas[replicaID]
+	if !ok {
+		return time.Time{}, false
+	}
+	st, ok := e.currentLoad[subUnitID]
+	if !ok {
+		return time.Time{}, false
+	}
+	return st.lastActivity, true
 }
 
 // All returns every currently-registered (non-expired-filtered) endpoint,
