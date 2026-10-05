@@ -23,7 +23,6 @@ package orchestrate
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -43,10 +42,11 @@ type Request struct {
 	MaxParts   int    `json:"max_parts"`   // optional upper bound from the submitter
 }
 
-// ErrTransactional: core retries a failed or expired sub-unit, so a
-// transactional (exactly-once) job cannot be fanned out until core lets a
-// job opt out of retries (open core item, recorded 2026-10-06).
-var ErrTransactional = errors.New("transactional jobs cannot be fanned out yet: core retries sub-units (needs per-job retry control in core)")
+// A transactional (exactly-once) job is fanned out with sub-units submitted
+// with max_attempts 1: core runs each at most once, and a failed or expired
+// sub-unit stops (retries_exhausted, P5 to an Approver) instead of being
+// run again; the orchestration then fails without merging. (Until core
+// v1.3 step 4a-2 added per-job retry control, such jobs were refused.)
 
 var capRe = regexp.MustCompile(`^[a-z0-9]+([._-][a-z0-9]+)*$`)
 
@@ -77,8 +77,13 @@ func (o *Orchestrator) Run(ctx context.Context, job *heain.Job) ([]byte, error) 
 	if !capRe.MatchString(req.Capability) {
 		return nil, heain.Permanent(fmt.Errorf("capability %q is not a capability name", req.Capability))
 	}
-	if req.Resume == "transactional" {
-		return nil, heain.Permanent(ErrTransactional)
+	attempts := 0 // policy p3.max_retry
+	switch req.Resume {
+	case "", "idempotent":
+	case "transactional":
+		attempts = 1
+	default:
+		return nil, heain.Permanent(fmt.Errorf("resume %q is not idempotent or transactional", req.Resume))
 	}
 	c := req.Capability
 	splitters, err := o.App.Discover(ctx, c+".split", 0)
@@ -163,7 +168,7 @@ func (o *Orchestrator) Run(ctx context.Context, job *heain.Job) ([]byte, error) 
 		go func(i int, u unit) {
 			defer wg.Done()
 			t, err := o.App.Submit(wctx, heain.JobRequest{Capability: c + ".unit", OriginZone: req.OriginZone, Payload: u.Payload,
-				IdempotencyKey: job.TicketID + ":" + u.ID, Classification: heain.Classification{Delivery: "IMMEDIATE"}})
+				IdempotencyKey: job.TicketID + ":" + u.ID, Classification: heain.Classification{Delivery: "IMMEDIATE"}, MaxAttempts: attempts})
 			wipe(u.Payload)
 			if err != nil {
 				results[i] = res{i: i, err: fmt.Errorf("submit %s: %w", u.ID, err)}

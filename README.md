@@ -60,3 +60,9 @@ author; contributions are welcome under the same license.
 - **Not yet:** transactional (exactly-once) jobs are refused — core retries sub-units and has no per-job retry control yet; an orchestration must finish within its lease (`dispatch.lease_default`/`lease_max`) — core has no lease extension yet; opaque checkpoints and Swarm (P7) sharing of what the planner learned come later.
 
 Tests: `go test ./...`; live `bash scripts/live_4a.sh` (needs `~/heain-core`, `~/heain-sdk`); conformance `heain-conformance run --app .` (with heain-textmod as companion).
+
+**Update (Step 4a-2, 2026-10-06): both "Not yet" items above are closed** by two heain-core controls:
+- **Transactional jobs are fanned out:** with `"resume": "transactional"` every sub-unit is submitted with `max_attempts` 1, so core runs it at most once; a failed or expired sub-unit stops (`retries_exhausted`, the Approver decides) and the orchestration fails without merging. Any other `resume` value than `idempotent`/`transactional` is refused.
+- **Long orchestrations keep their lease:** the heain-sdk Worker extends the lease of `job.orchestrate` (and the module's `C.unit` jobs) while they run, up to `dispatch.lease_max` per extension.
+
+Live 4a now has 19 checks: a transactional job under a 3 s lease is fanned out, delivered, its sub-units carry `max_attempts` 1 in core's audit, and both the orchestration and the sub-units extended their leases.

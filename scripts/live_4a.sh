@@ -7,7 +7,10 @@
 #    merge returns the result;
 #  - the planner learns from finished sub-units and keeps what it learned
 #    across a restart;
-#  - a transactional job is refused (core still retries sub-units).
+#  - a transactional job is fanned out with its sub-units submitted with
+#    max_attempts 1 (core runs each at most once; step 4a-2, 2026-10-06);
+#  - with a 3 s lease, the orchestration and its sub-units keep their leases
+#    through extensions (SDK Worker -> POST /v1/app/jobs/{t}/extend).
 # Every app is a plain process configured through HEAIN_* variables.
 # Needs ~/heain-core and ~/heain-sdk next to this repo. ~2 min.
 # Run from ~/heain-job:  bash scripts/live_4a.sh
@@ -109,10 +112,18 @@ r3=$(submit -cap text.upper -file "$W/in1.txt")
 [ "$(aud "R[0]['model']['artifact_sha256'] != R[-1]['model']['artifact_sha256']")" = True ] && ok "the record's model hash changes as the planner learns" || bad "model hash"
 as admin "$URL/v1/admin/audit?limit=5000" | grep -q "line one" && bad "raw job input reached core's audit" || ok "no raw input in core's audit (records hash the input)"
 
-echo "== 4. refusals"
-r4=$(submit -cap text.upper -file "$W/in1.txt" -resume transactional)
-echo "$r4" | grep -q "state=retries_exhausted" && [ "$(as admin "$URL/v1/admin/audit?limit=5000" | j "sum(1 for x in d['records'] if x['event']['Action']=='app.event' and 'transactional' in str(x['event']['Detail']))")" -ge 1 ] \
-  && ok "a transactional job is refused, not fanned out (core still retries sub-units)" || bad "transactional: $r4"
+echo "== 4. exactly-once fan-out under a short lease"
+[ "$(code admin -X PUT -d '{"value":"3s"}' $URL/v1/admin/config/system/dispatch.lease_default)" = 200 ] && ok "dispatch.lease_default -> 3 s (shorter than the orchestration)" || bad "lease_default"
+r4=$(submit -cap text.upper -file "$W/in2.txt" -resume transactional)
+TK4=$(echo "$r4" | awk '{print $2}')
+echo "$r4" | grep -q "state=delivered" && [ "$(echo "$r4" | sed 's/.*out=//')" = "MORE LINE 1" ] && ok "a transactional job is fanned out and delivered" || bad "transactional: $r4"
+[ "$(as admin "$URL/v1/admin/audit?limit=8000" | j "sum(1 for x in d['records'] if x['event']['Action']=='app.job_submitted' and x['event']['Detail']['capability']=='text.upper.unit' and x['event']['Detail'].get('max_attempts')==1)")" -ge 2 ] \
+  && ok "its sub-units were submitted with max_attempts 1 (core runs each at most once)" || bad "max_attempts audit"
+[ "$(as admin "$URL/v1/admin/audit?limit=8000" | j "sum(1 for x in d['records'] if x['event']['Action']=='app.job_lease_extended' and x['event']['Detail']['ticket_id']=='$TK4')")" -ge 1 ] \
+  && ok "the orchestration outlived its 3 s lease through $(as admin "$URL/v1/admin/audit?limit=8000" | j "sum(1 for x in d['records'] if x['event']['Action']=='app.job_lease_extended' and x['event']['Detail']['ticket_id']=='$TK4')") extensions" || bad "orchestration lease extension"
+[ "$(as admin "$URL/v1/admin/audit?limit=8000" | j "sum(1 for x in d['records'] if x['event']['Action']=='app.job_lease_extended' and x['event']['Detail']['capability']=='text.upper.unit')")" -ge 1 ] \
+  && ok "sub-units (2 s each) extended their leases too" || bad "unit lease extension"
+echo "== 5. refusals"
 r5=$(submit -cap no.such.module -file "$W/in1.txt")
 echo "$r5" | grep -q "state=retries_exhausted" && ok "a capability no module offers is refused" || bad "unknown module: $r5"
 [ "$(as admin "$URL/v1/admin/audit/verify" | j "d['ok']")" = True ] && ok "core audit chain verifies" || bad "audit verify"
