@@ -2,3 +2,6 @@
 *.key
 *.crt
 !LICENSE
+/heain-job
+/heain-job-submit
+conformance-report/

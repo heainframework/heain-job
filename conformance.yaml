@@ -1,0 +1,10 @@
+# heain-job under the heain conformance suite (heain-sdk conformance/).
+manifest: heain-app.yaml
+build: [go, build, -o, heain-job, ./cmd/heain-job]
+start: [./heain-job]
+companions: [examples/textmod]
+jobs:
+  - capability: job.orchestrate
+    payload: '{"capability":"text.upper","input_b64":"Y29uZm9ybWFuY2Utam9iLWxpbmUtMQpjb25mb3JtYW5jZS1qb2ItbGluZS0yCmNvbmZvcm1hbmNlLWpvYi1saW5lLTMK"}'
+    expect_output: "CONFORMANCE-JOB-LINE-1\nCONFORMANCE-JOB-LINE-2\nCONFORMANCE-JOB-LINE-3\n"
+    delivery: IMMEDIATE

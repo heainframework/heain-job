@@ -1,0 +1,17 @@
+# heain-textmod: a tiny module that offers the heain-job orchestration
+# contract for capability text.upper (example and test companion).
+manifest_version: 1
+app:
+  id: heain-textmod
+  version: 1.0.0
+  group: domain
+  description: Upper-cases text, split by lines across sub-units.
+  api: v1
+  sdk: {name: heain-sdk-go, version: ">=1.0.0"}
+capabilities:
+  - {name: text.upper.split, version: 1, formal: true, execution: direct, ai: {used: false}}
+  - {name: text.upper.unit, version: 1, formal: true, execution: job, ai: {used: false}}
+  - {name: text.upper.merge, version: 1, formal: true, execution: direct, ai: {used: false}}
+endpoints:
+  - {method: POST, path: /v1/split/text.upper, capability: text.upper.split, formal: true}
+  - {method: POST, path: /v1/merge/text.upper, capability: text.upper.merge, formal: true}

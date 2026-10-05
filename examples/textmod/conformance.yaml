@@ -1,0 +1,4 @@
+# used when heain-textmod runs as a companion of heain-job in the conformance suite
+manifest: heain-app.yaml
+build: [go, build, -o, textmod, .]
+start: [./textmod]

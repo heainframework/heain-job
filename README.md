@@ -42,3 +42,21 @@ API.
 
 Apache License 2.0 — see [LICENSE](./LICENSE). Copyright retained by the
 author; contributions are welcome under the same license.
+
+## heain-job v2 — rebuilt on heain-sdk v1 (Step 4a, 2026-10-06)
+
+**The text above describes the PoC version, kept as tag `legacy-v0`.** That version ran its own registry, shared-secret HTTP, its own retries and failover, and used heain-sdk packages (`coreclient`, `jobclient`) that no longer exist. heain-core 1.3 now does discovery, leases, retries, reassignment and placement itself, so heain-job keeps only the orchestration intelligence (design note "heain-job", Group A).
+
+**Author decisions (2026-10-06):** rebuild in this repo; heain-job drives the fan-out; its AI is a learned split planner.
+
+- **Capability `job.orchestrate`** (execution: job, formal, AI). Payload: `{"capability": C, "input_b64", "origin_zone", "max_parts", "resume"}`. heain-job:
+  1. asks its **planner** how many sub-units to make — it learns seconds per byte for each C from finished sub-units (moving average, kept in `HEAIN_STATE_DIR/planner-stats.json`, numbers only) and aims at a target sub-unit length, capped by live workers; each decision is a **signed reasoning record** (factors, model hash);
+  2. calls the module's **`C.split`** (direct, mTLS);
+  3. submits each sub-unit as a job on **`C.unit`** through core (P1–P4: encrypted, placed, leased, retried and reassigned by core), with the job's origin zone (P7);
+  4. waits, then calls the module's **`C.merge`** and returns the result.
+- **Module contract** (any module that wants orchestration): `C.split` `POST /v1/split/C` `{"parts","input_b64"} -> {"units":[{"id","payload_b64"}],"state_b64"}`; `C.unit` a job capability; `C.merge` `POST /v1/merge/C` `{"units":[{"id","output_b64"}],"state_b64"} -> {"output_b64"}`. heain-job declares them with the `uses[]` pattern `{app: "*", capabilities: ["*.split", "*.unit", "*.merge"]}`.
+- **`examples/textmod`** (heain-textmod) is a minimal module offering the contract for `text.upper`; **`cmd/heain-job-submit`** submits a job and prints the result.
+- **Runs any way you like** (plain process, service, container): configured through the heain-sdk `HEAIN_*` variables (`heain.StartFromEnv`).
+- **Not yet:** transactional (exactly-once) jobs are refused — core retries sub-units and has no per-job retry control yet; an orchestration must finish within its lease (`dispatch.lease_default`/`lease_max`) — core has no lease extension yet; opaque checkpoints and Swarm (P7) sharing of what the planner learned come later.
+
+Tests: `go test ./...`; live `bash scripts/live_4a.sh` (needs `~/heain-core`, `~/heain-sdk`); conformance `heain-conformance run --app .` (with heain-textmod as companion).

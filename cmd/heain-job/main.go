@@ -1,63 +1,56 @@
-// Command heain-job is the entrypoint for the heain-job orchestration
-// service. It never links against heain-core — see the package docs on
-// the heain-sdk coreclient package for how it talks to a running heain-core node.
-//
-// It runs two things side by side:
-//   - a coreclient connection to a heain-core node, for the actual P1-P4
-//     job lifecycle (ingest/dispatch/execute/staging);
-//   - its own local HTTP server, for sibling Layer 3 modules to register
-//     their SplitStrategy/MergeStrategy callback endpoints (see
-//     internal/httpserver and internal/jobapp.ModuleEndpoint's docs).
+// Command heain-job is the job-orchestration base app. It is configured
+// through the heain-sdk container contract (HEAIN_* variables, see
+// heain.StartFromEnv) and runs however the operator likes: a plain
+// process, a service unit, or a container.
 package main
 
 import (
+	"context"
 	"flag"
+	"fmt"
 	"log"
-	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-	"github.com/heainframework/heain-sdk/coreclient"
-
-	"github.com/heainframework/heain-job/internal/audit"
-	"github.com/heainframework/heain-job/internal/httpserver"
-	"github.com/heainframework/heain-job/internal/orchestrator"
-	"github.com/heainframework/heain-job/internal/registry"
+	"github.com/heainframework/heain-job/internal/orchestrate"
+	"github.com/heainframework/heain-job/internal/plan"
+	"github.com/heainframework/heain-sdk/heain"
 )
 
 func main() {
-	coreAddr := flag.String("core-addr", "", "base URL of the heain-core node to talk to, e.g. https://127.0.0.1:8443")
-	clientCert := flag.String("client-cert", "", "path to this node's mTLS client certificate")
-	clientKey := flag.String("client-key", "", "path to this node's mTLS client key")
-	caFile := flag.String("ca-file", "", "path to the heain-core deployment's CA certificate")
-	serverName := flag.String("server-name", "", "CN/SAN of the target heain-core node's certificate")
-	listenAddr := flag.String("addr", ":9400", "address heain-job's own registration/orchestration HTTP server listens on")
+	target := flag.Float64("target-unit-seconds", 20, "planner: aim for sub-units of about this many seconds")
+	perWorker := flag.Int("max-parts-per-worker", 2, "planner: at most this many sub-units per live worker")
+	concurrency := flag.Int("concurrency", 2, "orchestration jobs run at once")
 	flag.Parse()
-
-	if *coreAddr == "" {
-		log.Fatal("heain-job: -core-addr is required (the heain-core node's HTTP/mTLS address)")
-	}
-
-	core, err := coreclient.New(*coreAddr, coreclient.TLSConfig{
-		ClientCertFile: *clientCert,
-		ClientKeyFile:  *clientKey,
-		CAFile:         *caFile,
-		ServerName:     *serverName,
-	})
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	app, err := heain.StartFromEnv(ctx)
 	if err != nil {
-		log.Fatalf("heain-job: building coreclient: %v", err)
+		fmt.Fprintf(os.Stderr, "REFUSED: %v\n", err)
+		os.Exit(2)
 	}
-	_ = core // wired into the orchestration loop once job submission/dispatch is implemented
-
-	reg := registry.New()
-	auditLog := audit.NewLogger(os.Stdout) // v1: stdout only; see internal/audit's docs for the durable-backend plan
-	orch := orchestrator.New(reg, auditLog)
-	_ = orch // wired into job submission endpoints once they exist
-
-	srv := httpserver.New(reg, orch)
-
-	log.Printf("heain-job: connected client configured for heain-core at %s", *coreAddr)
-	log.Printf("heain-job: registration/orchestration HTTP server listening on %s", *listenAddr)
-	if err := http.ListenAndServe(*listenAddr, srv); err != nil {
+	state := os.Getenv("HEAIN_STATE_DIR")
+	if state == "" {
+		state = "/state"
+	}
+	pl, err := plan.Open(state, plan.Params{TargetUnitSeconds: *target, MaxPartsPerWorker: *perWorker})
+	if err != nil {
 		log.Fatal(err)
 	}
+	o := &orchestrate.Orchestrator{App: app, Planner: pl, Self: "job.orchestrate", UnitTimeout: 10 * time.Minute, Logf: log.Printf}
+	w := app.NewWorker()
+	w.Concurrency = *concurrency
+	if err := w.Handle("job.orchestrate", o.Run); err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("heain-job: registered (%s), waiting for admission", app.Status())
+	if err := app.WaitActive(ctx); err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("heain-job: active, orchestrating")
+	_ = w.Run(ctx)
+	_ = app.Close(context.Background())
+	log.Printf("heain-job: deregistered")
 }

@@ -1,0 +1,25 @@
+# heain-job: the job-orchestration base app (Step 4, rebuilt on heain-sdk v1).
+manifest_version: 1
+app:
+  id: heain-job
+  version: 2.0.0
+  group: base
+  description: Splits a module's job into sub-units, runs them through core (P1-P4), merges the results; an AI planner decides the split.
+  api: v1
+  sdk: {name: heain-sdk-go, version: ">=1.0.0"}
+capabilities:
+  - name: job.orchestrate
+    version: 1
+    formal: true
+    execution: job
+    ai:
+      used: true
+      model: {name: heain-job-split-planner, version: "1"}
+      reasoning_record: required
+uses:
+  # any module that offers the orchestration contract (<capability>.split / .unit / .merge)
+  - app: "*"
+    capabilities: ["*.split", "*.unit", "*.merge"]
+offline:
+  allowed: [job.orchestrate]
+  journal: required
