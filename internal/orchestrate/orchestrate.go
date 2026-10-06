@@ -23,6 +23,7 @@ package orchestrate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -58,6 +59,9 @@ type Orchestrator struct {
 	Self string
 	// UnitTimeout bounds the wait for all sub-units.
 	UnitTimeout time.Duration
+	// CallTimeout bounds each split and merge call (they may move the whole
+	// input and all outputs; default heain.DefaultCallTimeout).
+	CallTimeout time.Duration
 	Logf        func(string, ...any)
 }
 
@@ -142,8 +146,8 @@ func (o *Orchestrator) Run(ctx context.Context, job *heain.Job) ([]byte, error) 
 		State []byte `json:"state_b64,omitempty"`
 	}
 	if _, err := o.App.Call(ctx, heain.CallSpec{App: module, Capability: c + ".split", Method: "POST", Path: "/v1/split/" + c,
-		Body: map[string]any{"parts": d.Parts, "input_b64": req.Input}, Out: &sp}); err != nil {
-		return nil, fmt.Errorf("split: %w", err)
+		Body: map[string]any{"parts": d.Parts, "input_b64": req.Input}, Out: &sp, Timeout: o.CallTimeout}); err != nil {
+		return nil, callErr("split", err)
 	}
 	if len(sp.Units) == 0 {
 		return nil, heain.Permanent(fmt.Errorf("%s.split returned no sub-units", c))
@@ -208,13 +212,24 @@ func (o *Orchestrator) Run(ctx context.Context, job *heain.Job) ([]byte, error) 
 		Output []byte `json:"output_b64"`
 	}
 	if _, err := o.App.Call(ctx, heain.CallSpec{App: module, Capability: c + ".merge", Method: "POST", Path: "/v1/merge/" + c,
-		Body: map[string]any{"units": merged, "state_b64": sp.State}, Out: &mr}); err != nil {
-		return nil, fmt.Errorf("merge: %w", err)
+		Body: map[string]any{"units": merged, "state_b64": sp.State}, Out: &mr, Timeout: o.CallTimeout}); err != nil {
+		return nil, callErr("merge", err)
 	}
 	if o.Logf != nil {
 		o.Logf("heain-job: %s -> %d sub-units on %s, merged %d bytes", job.TicketID, len(sp.Units), module, len(mr.Output))
 	}
 	return mr.Output, nil
+}
+
+// callErr: a module that answers 4xx refused the input itself (bad request,
+// file not shared, ...), so retrying cannot help -- the job stops at once.
+// Anything else (5xx, unreachable, timeout) is retried by core.
+func callErr(step string, err error) error {
+	var ce *heain.CallError
+	if errors.As(err, &ce) && ce.Status >= 400 && ce.Status < 500 {
+		return heain.Permanent(fmt.Errorf("%s refused: %w", step, err))
+	}
+	return fmt.Errorf("%s: %w", step, err)
 }
 
 func wipe(b []byte) {

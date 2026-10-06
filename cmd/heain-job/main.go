@@ -23,6 +23,8 @@ func main() {
 	target := flag.Float64("target-unit-seconds", 20, "planner: aim for sub-units of about this many seconds")
 	perWorker := flag.Int("max-parts-per-worker", 2, "planner: at most this many sub-units per live worker")
 	concurrency := flag.Int("concurrency", 2, "orchestration jobs run at once")
+	unitTimeout := flag.Duration("unit-timeout", time.Hour, "how long an orchestration waits for all its sub-units")
+	callTimeout := flag.Duration("call-timeout", 10*time.Minute, "bound on each call to a module's split and merge (they carry the whole input and all outputs)")
 	flag.Parse()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -39,7 +41,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	o := &orchestrate.Orchestrator{App: app, Planner: pl, Self: "job.orchestrate", UnitTimeout: 10 * time.Minute, Logf: log.Printf}
+	o := &orchestrate.Orchestrator{App: app, Planner: pl, Self: "job.orchestrate", UnitTimeout: *unitTimeout, CallTimeout: *callTimeout, Logf: log.Printf}
 	w := app.NewWorker()
 	w.Concurrency = *concurrency
 	if err := w.Handle("job.orchestrate", o.Run); err != nil {
